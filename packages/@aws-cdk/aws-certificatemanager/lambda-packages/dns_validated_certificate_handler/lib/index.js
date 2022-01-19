@@ -14,6 +14,66 @@ let random = Math.random;
 let maxAttempts = 10;
 
 /**
+ * some alternative names will produce the same validation record
+ * as the main domain (eg. example.com + *.example.com)
+ * filtering duplicates to avoid errors with adding the same record
+ * to the route53 zone twice
+ * 
+ * @param {array} options 
+ * @returns 
+ */
+
+const uniqueRecords = function(options) {
+  const unique = options
+    .map((val) => val.ResourceRecord)
+    .reduce((acc, cur) => {
+      acc[cur.Name] = cur;
+      return acc;
+    }, {});
+  return Object.keys(unique).sort().map(key => unique[key]);
+}
+
+/**
+ * Create certificate validation records in hostedZone
+ *
+ * @param {object} route53 aws sdk client to use
+ * @param {string} action type of change to do e.g UPSERT or DELETE
+ * @param {array} records validation records
+ * @param {string} hostedZoneId the Route53 Hosted Zone ID
+ */
+const changeResourceRecordSets = async function(route53, action, records, hostedZoneId) {
+  const changeBatch = await route53.changeResourceRecordSets({
+    ChangeBatch: {
+      Changes: records.map((record) => {
+        console.log(`${record.Name} ${record.Type} ${record.Value}`)
+        return {
+          Action: action,
+          ResourceRecordSet: {
+            Name: record.Name,
+            Type: record.Type,
+            TTL: 60,
+            ResourceRecords: [{
+              Value: record.Value
+            }]
+          }
+        };
+      }),
+    },
+    HostedZoneId: hostedZoneId
+  }).promise();
+
+  console.log('Waiting for DNS records to commit...');
+  await route53.waitFor('resourceRecordSetsChanged', {
+    // Wait up to 5 minutes
+    $waiter: {
+      delay: 30,
+      maxAttempts: 10
+    },
+    Id: changeBatch.ChangeInfo.Id
+  }).promise();
+}
+
+/**
  * Upload a CloudFormation response object to S3.
  *
  * @param {object} event the Lambda event payload received by the handler function
@@ -118,17 +178,7 @@ const requestCertificate = async function (requestId, domainName, subjectAlterna
     const options = Certificate.DomainValidationOptions || [];
     // Ensure all records are ready; there is (at least a theory there's) a chance of a partial response here in rare cases.
     if (options.length > 0 && options.every(opt => opt && !!opt.ResourceRecord)) {
-      // some alternative names will produce the same validation record
-      // as the main domain (eg. example.com + *.example.com)
-      // filtering duplicates to avoid errors with adding the same record
-      // to the route53 zone twice
-      const unique = options
-        .map((val) => val.ResourceRecord)
-        .reduce((acc, cur) => {
-          acc[cur.Name] = cur;
-          return acc;
-        }, {});
-      records = Object.keys(unique).sort().map(key => unique[key]);
+      records = uniqueRecords(options);
     } else {
       // Exponential backoff with jitter based on 200ms base
       // component of backoff fixed to ensure minimum total wait time on
@@ -144,35 +194,7 @@ const requestCertificate = async function (requestId, domainName, subjectAlterna
 
   console.log(`Upserting ${records.length} DNS records into zone ${hostedZoneId}:`);
 
-  const changeBatch = await route53.changeResourceRecordSets({
-    ChangeBatch: {
-      Changes: records.map((record) => {
-        console.log(`${record.Name} ${record.Type} ${record.Value}`)
-        return {
-          Action: 'UPSERT',
-          ResourceRecordSet: {
-            Name: record.Name,
-            Type: record.Type,
-            TTL: 60,
-            ResourceRecords: [{
-              Value: record.Value
-            }]
-          }
-        };
-      }),
-    },
-    HostedZoneId: hostedZoneId
-  }).promise();
-
-  console.log('Waiting for DNS records to commit...');
-  await route53.waitFor('resourceRecordSetsChanged', {
-    // Wait up to 5 minutes
-    $waiter: {
-      delay: 30,
-      maxAttempts: 10
-    },
-    Id: changeBatch.ChangeInfo.Id
-  }).promise();
+  await changeResourceRecordSets(route53, 'UPSERT', records, hostedZoneId);
 
   console.log('Waiting for validation...');
   await acm.waitFor('certificateValidated', {
@@ -193,8 +215,9 @@ const requestCertificate = async function (requestId, domainName, subjectAlterna
  *
  * @param {string} arn The certificate ARN
  */
-const deleteCertificate = async function (arn, region) {
+const deleteCertificate = async function (arn, region, route53Endpoint, hostedZoneId) {
   const acm = new aws.ACM({ region });
+  const route53 = route53Endpoint ? new aws.Route53({ endpoint: route53Endpoint }) : new aws.Route53();
 
   try {
     console.log(`Waiting for certificate ${arn} to become unused`);
@@ -221,6 +244,14 @@ const deleteCertificate = async function (arn, region) {
     if (inUseByResources.length) {
       throw new Error(`Response from describeCertificate did not contain an empty InUseBy list after ${maxAttempts} attempts.`)
     }
+
+
+    const options = Certificate.DomainValidationOptions || [];
+    const records = uniqueRecords(options);
+
+    console.log(`Deleting ${records.length} DNS records into zone ${hostedZoneId}:`);
+
+    await changeResourceRecordSets(route53, 'DELETE', records, hostedZoneId);
 
     console.log(`Deleting certificate ${arn}`);
 
@@ -262,7 +293,12 @@ exports.certificateRequestHandler = async function (event, context) {
         // If the resource didn't create correctly, the physical resource ID won't be the
         // certificate ARN, so don't try to delete it in that case.
         if (physicalResourceId.startsWith('arn:')) {
-          await deleteCertificate(physicalResourceId, event.ResourceProperties.Region);
+          await deleteCertificate(
+            physicalResourceId,
+            event.ResourceProperties.Region,
+            event.ResourceProperties.Route53Endpoint,
+            event.ResourceProperties.HostedZoneId,
+            );
         }
         break;
       default:
